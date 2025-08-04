@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-time VAD Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 5px;
+        }
+        .status.connected {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .status.disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .status.speaking {
+            background-color: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeaa7;
+        }
+        .controls {
+            margin: 20px 0;
+        }
+        button {
+            padding: 10px 20px;
+            margin: 5px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+        .start-btn {
+            background-color: #007bff;
+            color: white;
+            border: none;
+        }
+        .stop-btn {
+            background-color: #dc3545;
+            color: white;
+            border: none;
+        }
+        .reset-btn {
+            background-color: #6c757d;
+            color: white;
+            border: none;
+        }
+        .log {
+            background-color: #f8f9fa;
+            border: 1px solid #dee2e6;
+            padding: 10px;
+            height: 300px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Real-time VAD Test</h1>
+    
+    <div id="status" class="status disconnected">
+        Status: Disconnected
+    </div>
+    
+    <div class="controls">
+        <button id="startBtn" class="start-btn">Start Recording</button>
+        <button id="stopBtn" class="stop-btn" disabled>Stop Recording</button>
+        <button id="resetBtn" class="reset-btn" disabled>Reset VAD</button>
+    </div>
+    
+    <div>
+        <label for="serverUrl">Server URL:</label>
+        <input type="text" id="serverUrl" value="ws://localhost:8000/v1/audio/realtime_vad" style="width: 400px;">
+    </div>
+    
+    <h3>Log:</h3>
+    <div id="log" class="log"></div>
+
+    <script>
+        let ws = null;
+        let mediaRecorder = null;
+        let audioContext = null;
+        let stream = null;
+        let isRecording = false;
+
+        const statusDiv = document.getElementById('status');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const resetBtn = document.getElementById('resetBtn');
+        const logDiv = document.getElementById('log');
+        const serverUrlInput = document.getElementById('serverUrl');
+
+        function log(message) {
+            const timestamp = new Date().toLocaleTimeString();
+            const logEntry = document.createElement('div');
+            logEntry.textContent = `[${timestamp}] ${message}`;
+            logDiv.appendChild(logEntry);
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        function updateStatus(status, className) {
+            statusDiv.textContent = `Status: ${status}`;
+            statusDiv.className = `status ${className}`;
+        }
+
+        function connectWebSocket() {
+            const url = serverUrlInput.value;
+            log(`Connecting to ${url}`);
+            
+            ws = new WebSocket(url);
+            
+            ws.onopen = function() {
+                log('WebSocket connected');
+                updateStatus('Connected', 'connected');
+                resetBtn.disabled = false;
+            };
+            
+            ws.onmessage = function(event) {
+                try {
+                    const data = JSON.parse(event.data);
+                    log(`Received: ${JSON.stringify(data)}`);
+                    
+                    if (data.event === 'speech_start') {
+                        updateStatus('Speech detected!', 'connected');
+                    } else if (data.event === 'speech_end') {
+                        updateStatus('Speech ended', 'speaking');
+                    } else if (data.error) {
+                        log(`Error: ${data.error} - ${data.message || ''}`);
+                    }
+                } catch (e) {
+                    log(`Received non-JSON message: ${event.data}`);
+                }
+            };
+            
+            ws.onclose = function() {
+                log('WebSocket disconnected');
+                updateStatus('Disconnected', 'disconnected');
+                resetBtn.disabled = true;
+            };
+            
+            ws.onerror = function(error) {
+                log(`WebSocket error: ${error}`);
+                updateStatus('Connection Error', 'disconnected');
+            };
+        }
+
+        async function startRecording() {
+            try {
+                log('Requesting microphone access...');
+                stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        sampleRate: 16000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true
+                    } 
+                });
+                
+                log('Microphone access granted');
+                
+                // Connect WebSocket if not already connected
+                if (!ws || ws.readyState !== WebSocket.OPEN) {
+                    connectWebSocket();
+                }
+                
+                // Create AudioContext for processing
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 16000
+                });
+                
+                const source = audioContext.createMediaStreamSource(stream);
+                const processor = audioContext.createScriptProcessor(4096, 1, 1);
+                
+                processor.onaudioprocess = function(e) {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        const inputData = e.inputBuffer.getChannelData(0);
+                        
+                        // Convert float32 to int16 and then to bytes
+                        const int16Array = new Int16Array(inputData.length);
+                        for (let i = 0; i < inputData.length; i++) {
+                            int16Array[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
+                        }
+                        
+                        // Convert to byte array
+                        const byteArray = new Uint8Array(int16Array.buffer);
+                        ws.send(byteArray);
+                    }
+                };
+                
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+                
+                isRecording = true;
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+                
+                log('Recording started');
+                
+            } catch (error) {
+                log(`Error starting recording: ${error.message}`);
+                updateStatus('Microphone Error', 'disconnected');
+            }
+        }
+
+        function stopRecording() {
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+                stream = null;
+            }
+            
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            
+            isRecording = false;
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            resetBtn.disabled = true;
+            
+            log('Recording stopped');
+            updateStatus('Stopped', 'disconnected');
+        }
+
+        function resetVAD() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send('reset');
+                log('VAD reset command sent');
+            }
+        }
+
+        // Event listeners
+        startBtn.addEventListener('click', startRecording);
+        stopBtn.addEventListener('click', stopRecording);
+        resetBtn.addEventListener('click', resetVAD);
+
+        // Initialize
+        log('Real-time VAD test page loaded');
+        log('Click "Start Recording" to begin testing');
+    </script>
+</body>
+</html>

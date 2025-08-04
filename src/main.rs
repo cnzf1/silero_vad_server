@@ -1,4 +1,10 @@
-use axum::{Extension, Router, extract::DefaultBodyLimit, routing::post};
+use std::sync::Arc;
+
+use axum::{
+    Extension, Router,
+    extract::DefaultBodyLimit,
+    routing::{get, post},
+};
 use clap::Parser;
 
 mod vad;
@@ -29,17 +35,21 @@ async fn main() {
     let vad_service =
         vad::VadService::new(&args.model_path, 128).expect("Failed to create VAD service");
 
-    let app = app(vad_service);
+    let vad_factory = vad::VadFactory::new(args.model_path.clone());
+
+    let app = app(vad_service, Arc::new(vad_factory));
 
     log::info!("Listening on {}", args.listen);
     let listener = tokio::net::TcpListener::bind(args.listen).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-fn app(vad_service: vad::VadService) -> Router {
+fn app(vad_service: vad::VadService, vad_factory: Arc<vad::VadFactory>) -> Router {
     // build our application with a route
     Router::new()
         .route("/v1/audio/vad", post(vad::vad_detect))
+        .route("/v1/audio/realtime_vad", get(vad::websocket_handler))
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB limit
         .layer(Extension(vad_service))
+        .layer(Extension(vad_factory))
 }

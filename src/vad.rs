@@ -1,4 +1,11 @@
-use axum::{Extension, Json, response::IntoResponse};
+use std::sync::Arc;
+
+use axum::{
+    Extension, Json,
+    extract::ws::{WebSocket, WebSocketUpgrade},
+    response::IntoResponse,
+    response::Response,
+};
 
 type VadReturnTx =
     tokio::sync::oneshot::Sender<Result<Vec<silero_vad_jit::SpeechTimestamp>, String>>;
@@ -128,4 +135,158 @@ pub async fn vad_detect(
     Json(serde_json::json!({
         "error": "No audio provided"
     }))
+}
+
+#[derive(Debug, Clone)]
+pub struct VadFactory {
+    pub model_path: String,
+}
+
+impl VadFactory {
+    pub fn new(model_path: String) -> Self {
+        VadFactory { model_path }
+    }
+
+    pub fn create(
+        &self,
+    ) -> anyhow::Result<silero_vad_jit::StreamingVad<silero_vad_jit::VadModelJit>> {
+        let vad = silero_vad_jit::VadModelJit::init_jit_model(
+            &self.model_path,
+            silero_vad_jit::tch::Device::cuda_if_available(),
+        )?;
+
+        let params = silero_vad_jit::VadParams {
+            sampling_rate: 16000,
+            ..Default::default()
+        };
+        let model = silero_vad_jit::SileroVad::from(vad);
+
+        Ok(silero_vad_jit::StreamingVad::new(model, params))
+    }
+}
+
+pub async fn websocket_handler(
+    ws: WebSocketUpgrade,
+    vad_factory: Extension<Arc<VadFactory>>,
+) -> Response {
+    let session = vad_factory.create();
+    if session.is_err() {
+        return Response::builder()
+            .status(500)
+            .body("Failed to create VAD session".into())
+            .unwrap();
+    }
+    let session = session.unwrap();
+    ws.on_upgrade(move |socket| handle_websocket(socket, session))
+}
+
+// todo: this function is a computationally intensive task, needs to be rewritten
+async fn handle_websocket(
+    mut socket: WebSocket,
+    mut session: silero_vad_jit::StreamingVad<silero_vad_jit::VadModelJit>,
+) {
+    log::info!("WebSocket connection established");
+
+    let mut ret = bytes::BytesMut::new();
+    let windows_size_samples = session.get_window_size_samples();
+
+    async fn process_audio(
+        session: &mut silero_vad_jit::StreamingVad<silero_vad_jit::VadModelJit>,
+        socket: &mut WebSocket,
+        data: &[u8],
+    ) -> anyhow::Result<()> {
+        let audio_16k = data
+            .chunks_exact(2)
+            .map(|chunk| {
+                let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+                sample as f32 / i16::MAX as f32
+            })
+            .collect::<Vec<f32>>();
+        match session.process_chunk(&audio_16k) {
+            Ok(Some(silero_vad_jit::VadEvent::SpeechStart)) => {
+                let _ = socket
+                    .send(axum::extract::ws::Message::Text(
+                        serde_json::json!({
+                            "event": "speech_start",
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await?;
+                Ok(())
+            }
+            Ok(Some(silero_vad_jit::VadEvent::SpeechEnd)) => {
+                let _ = socket
+                    .send(axum::extract::ws::Message::Text(
+                        serde_json::json!({
+                            "event": "speech_end",
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await?;
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(e) => {
+                log::error!("VAD processing error: {}", e);
+                let _ = socket
+                    .send(axum::extract::ws::Message::Text(
+                        serde_json::json!({
+                            "error": "VAD processing error",
+                            "message": e.to_string()
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await?;
+                Err(e.into())
+            }
+        }
+    }
+
+    while let Some(Ok(msg)) = socket.recv().await {
+        match msg {
+            axum::extract::ws::Message::Text(text) => {
+                log::info!("Received text message: {}", text);
+                if text == "reset" {
+                    session.reset();
+                    log::info!("VAD session reset");
+                }
+            }
+            axum::extract::ws::Message::Binary(mut data) => {
+                let reminder = windows_size_samples * 2 - ret.len();
+                if reminder < windows_size_samples * 2 {
+                    ret.extend_from_slice(&data[..reminder]);
+                    data = data.slice(reminder..);
+
+                    assert_eq!(ret.len(), windows_size_samples * 2);
+                    let r = process_audio(&mut session, &mut socket, &ret).await;
+                    if let Err(e) = r {
+                        log::error!("Failed to process audio: {}", e);
+                        break;
+                    }
+                    ret.clear();
+                }
+
+                for chunk in data.chunks(windows_size_samples * 2) {
+                    if chunk.len() < windows_size_samples * 2 {
+                        ret.extend_from_slice(chunk);
+                        continue;
+                    }
+
+                    let r = process_audio(&mut session, &mut socket, chunk).await;
+                    if let Err(e) = r {
+                        log::error!("Failed to process audio: {}", e);
+                        break;
+                    }
+                }
+            }
+            axum::extract::ws::Message::Close(_) => {
+                log::info!("WebSocket connection closed");
+                break;
+            }
+            _ => {}
+        }
+    }
 }

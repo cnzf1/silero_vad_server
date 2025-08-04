@@ -15,9 +15,10 @@ serde_json = "1.0"
 wav_io = "0.1.14"
 
 
-axum = { version = "0.8", features = ["multipart"] }
+axum = { version = "0.8", features = ["multipart", "ws"] }
 tokio = { version = "1.0", features = ["full"] }
 dotenv = "0.15.0"
 
 
-silero_vad_jit = "0.1"
+silero_vad_jit = { version = "0.2" }
+bytes = "1.10.1"
