@@ -19,6 +19,8 @@ curl -LO https://download.pytorch.org/libtorch/cpu/libtorch-macos-arm64-2.8.0.zi
 unzip libtorch-macos-arm64-2.8.0.zip
 ```
 
+Then, tell the system where to find your LibTorch.
+
 ```
 # Add to ~/.zprofile or ~/.bash_profile
 export LD_LIBRARY_PATH=$(pwd)/libtorch/lib:$LD_LIBRARY_PATH
